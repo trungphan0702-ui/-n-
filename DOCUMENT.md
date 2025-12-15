@@ -1,69 +1,60 @@
-Audio Measurement Toolkit
-
+# Audio Measurement Toolkit
 (Tkinter GUI – Backend Contract–First Architecture)
 
-1. Project Overview
+============================================================
 
-Purpose
-Toolkit đo lường & phân tích hệ thống audio, sử dụng GUI Tkinter làm lớp điều khiển, backend đảm nhiệm toàn bộ DSP, audio I/O và xuất kết quả.
+1. PROJECT OVERVIEW
+-------------------
 
-Các nhóm đo chính (bắt buộc cho mọi mode):
+Purpose:
+- Toolkit đo lường & phân tích hệ thống audio, sử dụng GUI Tkinter làm lớp điều khiển.
+- Backend chịu trách nhiệm toàn bộ DSP, audio I/O, streaming realtime và xuất artifact.
 
-THD (Total Harmonic Distortion)
+Các nhóm phép đo bắt buộc:
+- THD (Total Harmonic Distortion)
+- Compressor characteristics (threshold, ratio, gain offset, curve)
+- Attack / Release (time constants)
 
-Compressor characteristics (threshold, ratio, gain offset, curve)
+Use cases:
+- Realtime hardware loopback: phát stimulus → qua thiết bị ngoài → thu về → phân tích realtime
+- Offline analysis: phân tích WAV có sẵn
+- Compare input vs output: align, gain-match, latency, residual metrics
 
-Attack / Release (time constants)
 
-Use cases
+2. ARCHITECTURAL PRINCIPLES (NON-NEGOTIABLE)
+--------------------------------------------
 
-Realtime hardware loopback: phát stimulus → qua thiết bị ngoài → thu về → phân tích realtime + streaming plot
-
-Offline analysis: phân tích WAV có sẵn
-
-Compare input vs output: align, gain-match, latency, residual metrics
-
-2. Architectural Principles (NON-NEGOTIABLE)
 2.1 Contract-first (BẮT BUỘC)
-
-backend/contracts.py là public API duy nhất
-
-GUI chỉ import & gọi contracts
-
-Không gọi trực tiếp analysis/, audio/, utils/
+- backend/contracts.py là public API duy nhất
+- GUI chỉ import và gọi functions từ backend/contracts.py
+- GUI tuyệt đối không import trực tiếp analysis/, audio/, utils/
 
 2.2 GUI bất biến
+- File tham chiếu: GUI_D_3_2_1.py
+- Không được:
+  - Thay đổi layout
+  - Đổi tên widget / tab / button
+  - Di chuyển widget
+  - Tách GUI sang file khác
+- GUI chỉ:
+  - Thu thập input
+  - Gọi backend contracts
+  - Hiển thị log / kết quả / plot
 
-File tham chiếu: GUI_D_3_2_1.py
+2.3 Backend độc lập GUI
+- Backend không import tkinter, messagebox, Tk variables
+- Backend không phụ thuộc GUI state
+- Mọi xử lý dài chạy trong backend thread
 
-Không được:
 
-Thay đổi layout
+3. SYSTEM ARCHITECTURE
+----------------------
 
-Đổi tên widget / tab / button
-
-Tách GUI sang file khác
-
-GUI chỉ:
-
-Thu thập input
-
-Gọi backend contracts
-
-Hiển thị log / kết quả / plot
-
-2.3 Backend không phụ thuộc GUI
-
-Backend không import tkinter, messagebox, GUI state
-
-Mọi xử lý dài chạy trong thread backend
-
-3. System Architecture (Textual)
 g1-main/
-├─ GUI_D_3_2_1.py          ⭐ GUI chính (IMMUTABLE)
+├─ GUI_D_3_2_1.py          (IMMUTABLE GUI)
 │
 ├─ backend/
-│  └─ contracts.py        ⭐ PUBLIC API DUY NHẤT
+│  └─ contracts.py        (PUBLIC API DUY NHẤT)
 │
 ├─ analysis/
 │  ├─ thd.py
@@ -86,179 +77,165 @@ g1-main/
 │  └─ self_test.py
 └─ requirements.txt
 
-4. Backend API Contract (Chuẩn bắt buộc)
-4.1 Quy ước chữ ký hàm
+
+4. BACKEND API CONTRACT STANDARD
+--------------------------------
+
+4.1 Function naming rules
 
 Sync (nhanh, offline):
-
-run_xxx(request) -> XxxResult
-
+- run_xxx(request) -> XxxResult
 
 Async (realtime, loopback):
+- start_xxx(request, *, stop_event, on_progress, on_log) -> XxxHandle
 
-start_xxx(
-    request,
-    *,
-    stop_event,
-    on_progress,
-    on_log
-) -> XxxHandle
+GUI không được tự tạo thread DSP.
 
 
-GUI không được tự tạo thread DSP, chỉ dùng handle.
+5. STREAMING REALTIME (BẮT BUỘC)
+--------------------------------
 
-5. Streaming Realtime (BẮT BUỘC)
-5.1 ProgressEvent
+- Mọi realtime measurement phải stream dữ liệu theo chunk
+- Dùng ProgressEvent
+- Không trả matplotlib figure
 
-Dùng cho realtime plot
+Chuẩn ProgressEvent:
+- phase = "streaming"
+- meta bắt buộc có:
+  - "chunk": index
+  - "data": payload thuần (spectrum / envelope / gain_reduction / ...)
 
-Payload KHÔNG là matplotlib figure
-
+Ví dụ:
 ProgressEvent(
     phase="streaming",
-    percent=None,
-    message="",
     meta={
         "chunk": i,
-        "data": {
-            # spectrum / envelope / gain_reduction / ...
-        }
+        "data": {...}
     }
 )
 
 
-chunk bắt buộc
+6. ARTIFACT & METADATA STANDARD
+-------------------------------
 
-GUI dùng meta["data"] để vẽ realtime
+Mọi phép đo phải xuất artifact CSV và/hoặc WAV.
 
-6. Artifact & Metadata Standard
+Artifact meta bắt buộc tối thiểu:
+- feature: thd | compressor | attack_release | compare
+- mode: offline | loopback
+- sample_rate
+- channels
+- input_device (nếu loopback)
+- output_device (nếu loopback)
+- stimulus (freq, level, step, v.v.)
+- run_id (UUID)
+- timestamp (ISO-8601)
 
-Mọi phép đo phải xuất artifact (CSV và/hoặc WAV).
-
-6.1 Artifact fields
+Ví dụ:
 Artifact(
-    kind="wav | csv | json",
+    kind="wav",
     path="...",
     meta={
-        "feature": "thd | compressor | attack_release | compare",
-        "mode": "offline | loopback",
+        "feature": "thd",
+        "mode": "loopback",
         "sample_rate": 48000,
         "channels": 1,
         "input_device": "...",
         "output_device": "...",
         "stimulus": {...},
         "run_id": "...",
-        "timestamp": "ISO-8601"
+        "timestamp": "..."
     }
 )
 
 
-👉 Mục tiêu: không nhầm giữa các lần chạy / chế độ / thiết bị
+7. FEATURE COVERAGE RULE
+------------------------
 
-7. Measurement Coverage Rules
-FeatureOfflineRealtime
-THD✅✅
-Compressor✅✅
-Attack/Release✅✅
+Mọi feature phải có cả Offline và Realtime:
 
-Không được có feature “chỉ offline” hoặc “chỉ realtime”.
+- THD: offline + loopback
+- Compressor: offline + loopback
+- Attack/Release: offline + loopback
 
-8. Execution Model
+Không được tồn tại feature chỉ chạy 1 mode.
+
+
+8. EXECUTION MODEL
+------------------
+
 8.1 Realtime loopback
-
-GUI → start_xxx(...)
-
-Backend:
-
-validate device
-
-generate stimulus
-
-play & record
-
-stream chunk → on_progress
-
-phân tích DSP
-
-export artifact
-
-GUI:
-
-hiển thị log
-
-vẽ realtime
-
-chờ handle.join()
+- GUI gọi start_xxx()
+- Backend:
+  - validate device
+  - generate stimulus
+  - play & record
+  - stream chunk qua on_progress
+  - phân tích DSP
+  - export artifact
+- GUI:
+  - hiển thị log
+  - vẽ realtime
+  - gọi handle.join()
 
 8.2 Offline
+- GUI chọn WAV
+- GUI gọi run_xxx()
+- Backend:
+  - đọc WAV
+  - phân tích
+  - trả summary + plots + artifacts
 
-GUI chọn WAV
 
-GUI gọi run_xxx(...)
+9. THREADING & CANCELLATION
+---------------------------
 
-Backend:
+- Mọi realtime task phải:
+  - chạy trong backend thread
+  - check stop_event thường xuyên
+- GUI chỉ:
+  - handle.cancel()
+  - handle.join()
 
-đọc WAV
 
-phân tích
+10. PLOTTING STRATEGY
+---------------------
 
-trả summary + plots + artifacts
+- Backend chỉ trả PlotSpec (data + metadata)
+- GUI hoặc utils chịu trách nhiệm render matplotlib
+- Backend tuyệt đối không tạo plot
 
-9. Threading & Cancellation
 
-Mọi realtime task:
+11. TESTING STRATEGY
+--------------------
 
-chạy trong backend thread
+- tests/self_test.py:
+  - test DSP offline
+  - test audio I/O
+- GUI testing: manual (GUI immutable)
 
-bắt buộc check stop_event
 
-GUI chỉ gọi:
+12. EXTENSION RULES (RẤT QUAN TRỌNG)
+------------------------------------
 
-handle.cancel()
+ĐƯỢC PHÉP:
+- Thêm feature mới qua backend/contracts.py
+- Mở rộng analysis/, audio/
+- Thêm field vào summary / artifact / meta
 
-handle.join()
+CẤM:
+- Đưa DSP vào GUI
+- GUI import analysis/audio trực tiếp
+- Thay đổi layout GUI
+- Bỏ qua streaming chunk hoặc metadata
 
-10. Plotting Strategy
 
-Backend chỉ trả PlotSpec
-
-GUI / utils:
-
-translate PlotSpec → matplotlib
-
-Không tạo plot trong backend
-
-11. Testing Strategy
-
-tests/self_test.py:
-
-test DSP offline
-
-test I/O cơ bản
-
-Không test GUI tự động (GUI immutable)
-
-12. Extension Rules (RẤT QUAN TRỌNG)
-Được phép
-
-Thêm phép đo mới → thêm API trong contracts.py
-
-Mở rộng DSP trong analysis/
-
-Thêm field vào summary / artifact / meta
-
-CẤM
-
-Đưa DSP vào GUI
-
-GUI import trực tiếp analysis/, audio/
-
-Thay đổi layout GUI
-
-Bỏ qua streaming chunk hoặc artifact metadata
-
-13. Final Statement
+13. FINAL STATEMENT
+-------------------
 
 Backend public API = backend/contracts.py
+
 GUI chỉ là client của contracts.
-Kiến trúc này đã CHỐT và là nền tảng cho toàn bộ phát triển tiếp theo
+
+Tài liệu này là SOURCE OF TRUTH cho toàn bộ project.
+Mọi code viết sau phải tuân thủ tuyệt đối tài liệu này.
