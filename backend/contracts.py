@@ -2,27 +2,40 @@
 """
 Backend API Contract for Audio Measurement Toolkit.
 
-NON-NEGOTIABLE:
-- GUI_D_3_2_1.py is the immutable reference GUI.
+NON-NEGOTIABLE
+- GUI_D_3_2_1.py is the immutable reference GUI layout.
 - Backend must NOT import tkinter / messagebox / depend on GUI state.
-- GUI should call ONLY the public facade functions defined in this module.
+- GUI must call ONLY the public facade functions defined in this module:
+    from backend.contracts import ...
 
-Public API rules:
-- Sync (fast):   run_xxx(request) -> XxxResult
-- Async (long):  start_xxx(request, *, stop_event, on_progress, on_log) -> XxxHandle
+API rules
+- Sync (fast):   run_xxx(request) -> MeasurementResult-like object (here: Result)
+- Async (long):  start_xxx(request, *, stop_event, on_progress, on_log) -> Handle(join/cancel/is_running)
+
+Realtime streaming requirement
+- During loopback streaming, backend MUST call on_progress with:
+    ProgressEvent(phase="streaming", meta={"chunk": <int>, "data": <plain_dict>})
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Callable, Literal, Optional, Protocol, Sequence
+import csv
+import datetime as _dt
+import math
 import threading
 import time
-import os
+import uuid
+import wave
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Literal, Sequence
 
-# =========================
-# Error model (standard)
-# =========================
+import numpy as np
+
+
+# ============================================================
+# Error model
+# ============================================================
 
 class BackendError(Exception):
     """Base class for backend errors."""
@@ -48,1011 +61,741 @@ class CancelledError(BackendError):
     """Operation cancelled via stop_event or handle.cancel()."""
 
 
-# =========================
-# Common data structures
-# =========================
+# ============================================================
+# Events
+# ============================================================
 
-@dataclass(frozen=True)
-class PlotSpec:
-    """
-    Plot description ONLY (no matplotlib figure objects).
-    GUI-side code (or utils/plot_windows.py) may translate PlotSpec -> real plots.
-    """
-    kind: Literal[
-        "thd_snapshot",
-        "compressor_curve",
-        "ar_envelope",
-        "compare_overlay",
-        "spectrum",
-    ]
-    title: str
-    x: list[float] | None = None
-    y: list[float] | None = None
-    series: list[dict[str, Any]] = field(default_factory=list)
-    meta: dict[str, Any] = field(default_factory=dict)
+LogLevel = Literal["DEBUG", "INFO", "WARN", "ERROR"]
+Phase = Literal["validate", "stimulus", "playrec", "streaming", "analyze", "export", "done"]
 
 
 @dataclass(frozen=True)
-class Artifact:
-    """File outputs produced by backend."""
-    kind: Literal["wav", "csv", "json", "txt", "other"]
-    path: str
-    description: str = ""
+class LogEvent:
+    level: LogLevel = "INFO"
+    message: str = ""
     meta: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class ProgressEvent:
-    """Streaming progress for long tasks."""
-    phase: str
-    percent: float | None = None  # 0..100
+    phase: Phase
+    percent: float | None = None
     message: str = ""
+    # IMPORTANT: when phase="streaming", meta MUST include {"chunk": int, "data": dict}
     meta: dict[str, Any] = field(default_factory=dict)
 
 
+# ============================================================
+# Output models (minimal, GUI-friendly)
+# ============================================================
+
+Feature = Literal["audio_io", "thd", "compressor", "attack_release", "compare", "loopback_record"]
+Mode = Literal["offline", "loopback_realtime"]
+ArtifactKind = Literal["csv", "wav"]
+
+
 @dataclass(frozen=True)
-class LogEvent:
-    """Streaming log event for GUI to display."""
-    level: Literal["DEBUG", "INFO", "WARN", "ERROR"] = "INFO"
-    message: str = ""
+class Artifact:
+    kind: ArtifactKind
+    path: str
+    description: str = ""
     meta: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
-class BaseResult:
-    """
-    Standard result payload.
-    GUI can display summary keys and list artifacts/plots.
-    """
+class Result:
+    feature: Feature
+    mode: Mode
     summary: dict[str, Any] = field(default_factory=dict)
-    plots: list[PlotSpec] = field(default_factory=list)
     artifacts: list[Artifact] = field(default_factory=list)
     logs: list[str] = field(default_factory=list)
 
 
-# =========================
-# Handle interface
-# =========================
+class Handle:
+    def __init__(self, thread: threading.Thread, stop_event: threading.Event, box: dict[str, Any]):
+        self._t = thread
+        self._stop = stop_event
+        self._box = box
 
-class XxxHandle(Protocol):
-    def join(self, timeout: float | None = None) -> BaseResult: ...
-    def cancel(self) -> None: ...
-    def is_running(self) -> bool: ...
-
-
-@dataclass
-class ThreadHandle:
-    """
-    Simple worker-thread handle implementing:
-    - join(): returns BaseResult (or raises)
-    - cancel(): cooperative cancellation via stop_event
-    - is_running()
-    """
-    _thread: threading.Thread
-    _stop_event: threading.Event
-    _result_box: dict[str, Any]
-    _lock: threading.Lock = field(default_factory=threading.Lock)
-
-    def join(self, timeout: float | None = None) -> BaseResult:
-        self._thread.join(timeout=timeout)
-        if self._thread.is_alive():
-            raise TimeoutError("Worker still running.")
-        with self._lock:
-            err = self._result_box.get("error")
-            if err is not None:
-                raise err
-            res = self._result_box.get("result")
-            if res is None:
-                raise BackendError("Worker finished without result.")
-            return res
+    def join(self, timeout: float | None = None) -> Result:
+        self._t.join(timeout=timeout)
+        if self._t.is_alive():
+            raise BackendError("Task still running")
+        exc = self._box.get("exc")
+        if exc is not None:
+            raise exc
+        res = self._box.get("result")
+        if res is None:
+            raise BackendError("Task finished without result")
+        return res
 
     def cancel(self) -> None:
-        self._stop_event.set()
+        self._stop.set()
 
     def is_running(self) -> bool:
-        return self._thread.is_alive()
+        return self._t.is_alive()
 
 
-# =========================
-# Requests / Results
-# =========================
+def _start_async(name: str, fn: Callable[[], Result], stop_event: threading.Event) -> Handle:
+    box: dict[str, Any] = {}
 
-# ---- Audio I/O ----
+    def worker():
+        try:
+            box["result"] = fn()
+        except Exception as exc:
+            box["exc"] = exc
+
+    t = threading.Thread(target=worker, daemon=True, name=name)
+    t.start()
+    return Handle(t, stop_event, box)
+
+
+# ============================================================
+# Requests (match GUI imports)
+# ============================================================
 
 @dataclass(frozen=True)
 class ListDevicesRequest:
-    """List available audio devices."""
-    pass
-
-
-@dataclass
-class ListDevicesResult(BaseResult):
-    pass
-
-
-@dataclass(frozen=True)
-class ValidateDeviceRequest:
-    """Validate indices and basic stream parameters."""
-    input_device: int | None
-    output_device: int | None
-    samplerate: float | None = None
-    input_channels: int = 1
-    output_channels: int = 2
-
-
-@dataclass
-class ValidateDeviceResult(BaseResult):
-    pass
+    ...
 
 
 @dataclass(frozen=True)
 class ReadWavRequest:
     path: str
-    mono: bool = True
 
-
-@dataclass
-class ReadWavResult(BaseResult):
-    fs: int | None = None
-    n_samples: int | None = None
-    n_channels: int | None = None
-
-
-@dataclass(frozen=True)
-class WriteWavRequest:
-    path: str
-    fs: int
-    samples: Sequence[float] | Sequence[Sequence[float]]  # mono or multi
-
-
-@dataclass
-class WriteWavResult(BaseResult):
-    pass
-
-
-@dataclass(frozen=True)
-class LoopbackRecordRequest:
-    """
-    Play input_wav_path to output_device and record from input_device,
-    then write recorded to output_path.
-    """
-    input_wav_path: str
-    input_device: int | None
-    output_device: int | None
-    output_path: str
-    input_channels: int = 1
-
-
-@dataclass
-class LoopbackRecordResult(BaseResult):
-    pass
-
-
-# ---- Compare ----
-
-@dataclass(frozen=True)
-class CompareRequest:
-    ref_wav_path: str
-    tgt_wav_path: str
-    freq_hz: float = 1000.0
-    hmax: int = 5
-    max_lag_seconds: float = 5.0
-
-
-@dataclass
-class CompareResult(BaseResult):
-    pass
-
-
-# ---- THD ----
 
 @dataclass(frozen=True)
 class ThdOfflineRequest:
     wav_path: str
     freq_hz: float = 1000.0
     hmax: int = 5
+    export_csv: bool = True
+    out_dir: str | None = None
 
-
-@dataclass
-class ThdResult(BaseResult):
-    pass
-
-
-@dataclass(frozen=True)
-class ThdRealtimeRequest:
-    freq_hz: float = 1000.0
-    amp: float = 0.7
-    hmax: int = 5
-    input_device: int | None = None
-    output_device: int | None = None
-    samplerate: float | None = None
-    base_dir: str = "."
-
-
-# ---- Compressor ----
 
 @dataclass(frozen=True)
 class CompressorOfflineRequest:
     wav_path: str
     freq_hz: float = 1000.0
+    export_csv: bool = True
+    out_dir: str | None = None
 
-
-@dataclass
-class CompressorResult(BaseResult):
-    pass
-
-
-@dataclass(frozen=True)
-class CompressorRealtimeRequest:
-    freq_hz: float = 1000.0
-    amp_max: float = 1.36
-    input_device: int | None = None
-    output_device: int | None = None
-    samplerate: float | None = None
-    base_dir: str = "."
-
-
-# ---- Attack/Release ----
 
 @dataclass(frozen=True)
 class AROfflineRequest:
     wav_path: str
     rms_win_ms: float = 5.0
-
-
-@dataclass
-class ARResult(BaseResult):
-    pass
+    export_csv: bool = True
+    out_dir: str | None = None
 
 
 @dataclass(frozen=True)
-class ARRealtimeRequest:
+class CompareRequest:
+    ref_wav_path: str
+    tgt_wav_path: str
+    max_lag_s: float = 1.0
+    export_csv: bool = True
+    out_dir: str | None = None
+
+
+@dataclass(frozen=True)
+class ThdLoopbackRequest:
+    freq_hz: float = 1000.0
+    amp: float = 0.7
+    hmax: int = 5
+    duration_s: float = 2.0
+    sample_rate: int | None = None
+    channels: int = 1
+    input_device: int | None = None
+    output_device: int | None = None
+    export_csv: bool = True
+    export_wav: bool = True
+    out_dir: str | None = None
+    blocksize: int = 2048
+
+
+@dataclass(frozen=True)
+class CompressorLoopbackRequest:
+    freq_hz: float = 1000.0
+    amp_max: float = 1.0
+    levels: list[float] | None = None
+    step_duration_s: float = 0.25
+    sample_rate: int | None = None
+    channels: int = 1
+    input_device: int | None = None
+    output_device: int | None = None
+    export_csv: bool = True
+    export_wav: bool = True
+    out_dir: str | None = None
+    blocksize: int = 2048
+
+
+@dataclass(frozen=True)
+class ARLoopbackRequest:
     freq_hz: float = 1000.0
     amp: float = 0.7
     rms_win_ms: float = 5.0
+    duration_s: float = 2.0
+    sample_rate: int | None = None
+    channels: int = 1
     input_device: int | None = None
     output_device: int | None = None
-    samplerate: float | None = None
-    base_dir: str = "."
+    export_csv: bool = True
+    export_wav: bool = True
+    out_dir: str | None = None
+    blocksize: int = 2048
 
 
-# =========================
-# Internal helpers
-# =========================
-
-def _now_ts() -> str:
-    return time.strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _ensure_file(path: str) -> None:
-    if not path or not os.path.isfile(path):
-        raise InvalidRequestError(f"File not found: {path}")
-
-
-def _import_numpy():
-    try:
-        import numpy as np  # type: ignore
-    except Exception as e:
-        raise BackendError("numpy is required for backend contracts.") from e
-    return np
+@dataclass(frozen=True)
+class LoopbackRecordRequest:
+    input_wav_path: str
+    output_path: str | None = None
+    input_device: int | None = None
+    output_device: int | None = None
+    sample_rate: int | None = None
+    input_channels: int = 1
+    output_channels: int = 1
+    blocksize: int = 2048
 
 
-def _to_1d_float_array(x: Any):
-    np = _import_numpy()
-    arr = np.asarray(x, dtype=float)
-    if arr.ndim == 2:
-        # take first channel for mono
-        arr = arr[:, 0]
-    return arr.astype(float)
+# ============================================================
+# Common helpers
+# ============================================================
+
+def _utc_now_iso() -> str:
+    return _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
-def _safe_log(on_log: Callable[[LogEvent], None] | None, level: str, msg: str, **meta: Any) -> None:
+def _new_run_id() -> str:
+    return _dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8]
+
+
+def _default_runs_dir() -> Path:
+    return Path.cwd() / "runs"
+
+
+def _resolve_out_dir(out_dir: str | None, run_id: str) -> Path:
+    base = Path(out_dir) if out_dir else _default_runs_dir()
+    return base / run_id
+
+
+def _ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+
+def _emit_log(on_log: Callable[[LogEvent], None] | None, level: LogLevel, msg: str, **meta: Any) -> None:
     if on_log:
         on_log(LogEvent(level=level, message=msg, meta=dict(meta)))
 
 
-def _safe_progress(on_progress: Callable[[ProgressEvent], None] | None, phase: str, percent: float | None, msg: str, **meta: Any) -> None:
-    if on_progress:
-        on_progress(ProgressEvent(phase=phase, percent=percent, message=msg, meta=dict(meta)))
-
-
-def _make_handle(
-    worker: Callable[[], BaseResult],
+def _emit_progress(
+    on_progress: Callable[[ProgressEvent], None] | None,
+    phase: Phase,
     *,
-    name: str,
-    stop_event: threading.Event,
-) -> ThreadHandle:
-    box: dict[str, Any] = {}
-    lock = threading.Lock()
-
-    def run():
-        try:
-            if stop_event.is_set():
-                raise CancelledError()
-            res = worker()
-            with lock:
-                box["result"] = res
-        except Exception as e:
-            with lock:
-                box["error"] = e
-
-    t = threading.Thread(target=run, daemon=True, name=name)
-    t.start()
-    return ThreadHandle(t, stop_event, box, lock)
+    percent: float | None = None,
+    message: str = "",
+    meta: dict[str, Any] | None = None,
+) -> None:
+    if on_progress:
+        on_progress(ProgressEvent(phase=phase, percent=percent, message=message, meta=meta or {}))
 
 
-def _normalize_align_result(ret: Any):
-    """
-    Accept several possible signatures from analysis.compare.align_signals:
-    - (a_aligned, b_aligned, lag)
-    - (a_aligned, b_aligned, lag, extra...)
-    """
-    if not isinstance(ret, (tuple, list)) or len(ret) < 3:
-        raise DSPError("align_signals() returned unexpected value.")
-    a_al, b_al, lag = ret[0], ret[1], ret[2]
-    return a_al, b_al, lag
+def _as_mono(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x)
+    if x.ndim == 1:
+        return x
+    if x.ndim == 2:
+        return x.mean(axis=1)
+    raise InvalidRequestError("Audio must be 1D or 2D")
 
 
-def _normalize_gain_match_result(ret: Any):
-    """
-    Accept possible signatures from analysis.compare.gain_match:
-    - (b_matched, gain_error_db)
-    - (b_matched, gain_error_db, extra...)
-    """
-    if not isinstance(ret, (tuple, list)) or len(ret) < 2:
-        raise DSPError("gain_match() returned unexpected value.")
-    return ret[0], ret[1]
-
-
-def _try_call(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-    """Call function, raising DSPError with context."""
-    try:
-        return fn(*args, **kwargs)
-    except CancelledError:
-        raise
-    except Exception as e:
-        raise DSPError(f"{fn.__module__}.{fn.__name__} failed: {e}") from e
-
-
-# =========================
-# Public Facade API
-# =========================
-
-# -------- Audio device APIs --------
-
-def run_list_devices(request: ListDevicesRequest) -> ListDevicesResult:
-    """
-    List available audio input/output devices.
-
-    Returns:
-        ListDevicesResult.summary:
-            - inputs: list[str]   (GUI-friendly device strings)
-            - outputs: list[str]
-            - signature: str|None (optional, for GUI caching if available)
-    """
-    from audio import devices as dev  # project module
-
-    inputs, outputs = dev.list_devices(raise_on_error=True)
-    signature = None
-    if hasattr(dev, "get_devices_signature"):
-        try:
-            signature = dev.get_devices_signature()
-        except Exception:
-            signature = None
-
-    res = ListDevicesResult()
-    res.summary = {"inputs": inputs, "outputs": outputs, "signature": signature}
-    return res
-
-
-def run_validate_device(request: ValidateDeviceRequest) -> ValidateDeviceResult:
-    """
-    Validate a device configuration for play/record.
-
-    Backend strategy:
-    - If audio.devices.validate_device_config exists, use it.
-    - Else, perform a conservative validation using sounddevice query if available.
-    """
-    # Prefer project helper
-    from audio import devices as dev
-
-    if hasattr(dev, "validate_device_config"):
-        ok, details = dev.validate_device_config(
-            request.input_device,
-            request.output_device,
-            samplerate=request.samplerate,
-            input_channels=request.input_channels,
-            output_channels=request.output_channels,
-        )
-        if not ok:
-            raise DeviceError(details.get("reason", "Invalid device config"))
-        res = ValidateDeviceResult()
-        res.summary = {"ok": True, "details": details}
-        return res
-
-    # Fallback: sounddevice query (no GUI dependency)
+def _import_sounddevice():
     try:
         import sounddevice as sd  # type: ignore
-        details: dict[str, Any] = {}
-        if request.input_device is not None:
-            d_in = sd.query_devices(request.input_device)
-            details["input"] = d_in
-            if request.input_channels > int(d_in.get("max_input_channels", 0)):
-                raise DeviceError("Input channels exceed device capability")
-        if request.output_device is not None:
-            d_out = sd.query_devices(request.output_device)
-            details["output"] = d_out
-            if request.output_channels > int(d_out.get("max_output_channels", 0)):
-                raise DeviceError("Output channels exceed device capability")
-        sr = request.samplerate
-        if sr is None:
-            # Try using default samplerate from output device if present
-            try:
-                sr = float(details.get("output", {}).get("default_samplerate"))
-            except Exception:
-                sr = None
-        res = ValidateDeviceResult()
-        res.summary = {"ok": True, "details": details, "samplerate": sr}
-        return res
-    except DeviceError:
-        raise
-    except Exception as e:
-        raise DeviceError(f"Device validation failed: {e}") from e
+        return sd
+    except Exception as exc:
+        raise DeviceError("sounddevice is required for realtime loopback. Install: pip install sounddevice") from exc
 
 
-# -------- WAV APIs --------
+# ============================================================
+# WAV I/O (self-contained)
+# ============================================================
 
-def run_wav_read(request: ReadWavRequest) -> ReadWavResult:
-    """
-    Read WAV file. Returns metadata in summary.
+def _wav_read(path: Path) -> tuple[int, np.ndarray]:
+    with wave.open(str(path), "rb") as wf:
+        sr = wf.getframerate()
+        ch = wf.getnchannels()
+        sw = wf.getsampwidth()
+        n = wf.getnframes()
+        raw = wf.readframes(n)
 
-    Note: Result does not return full samples by default (GUI doesn't need them).
-    """
-    _ensure_file(request.path)
-    from audio import wav_io
+    if sw == 2:
+        a = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    elif sw == 4:
+        a = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+    else:
+        raise AudioIOError(f"Unsupported sampwidth={sw} bytes")
 
-    fs, data = wav_io.read_wav(request.path)
-    if fs is None:
-        raise AudioIOError(f"Cannot read wav: {request.path}")
-
-    np = _import_numpy()
-    arr = np.asarray(data)
-    n_channels = 1 if arr.ndim == 1 else arr.shape[1]
-    n_samples = arr.shape[0]
-
-    res = ReadWavResult()
-    res.fs = int(fs)
-    res.n_samples = int(n_samples)
-    res.n_channels = int(n_channels)
-    res.summary = {"path": request.path, "fs": int(fs), "n_samples": int(n_samples), "n_channels": int(n_channels)}
-    return res
+    if ch > 1:
+        a = a.reshape(-1, ch)
+    return int(sr), a
 
 
-def run_wav_write(request: WriteWavRequest) -> WriteWavResult:
-    """
-    Write WAV file using project wav_io.write_wav if available.
+def _wav_write(path: Path, samples: np.ndarray, sr: int) -> None:
+    x = np.asarray(samples)
+    if x.ndim == 1:
+        ch = 1
+        flat = x
+    elif x.ndim == 2:
+        ch = int(x.shape[1])
+        flat = x.reshape(-1)
+    else:
+        raise AudioIOError("samples must be 1D/2D")
 
-    If wav_io.write_wav has different signature, this tries common patterns.
-    """
-    from audio import wav_io
-    # attempt common signatures: write_wav(path, data, fs) or write_wav(path, data, fs, ...)
-    ok = None
-    try:
-        ok = wav_io.write_wav(request.path, request.samples, request.fs)
-    except TypeError:
-        try:
-            ok = wav_io.write_wav(request.path, request.fs, request.samples)
-        except Exception as e:
-            raise AudioIOError(f"Cannot write wav: {e}") from e
-    except Exception as e:
-        raise AudioIOError(f"Cannot write wav: {e}") from e
+    _ensure_dir(path.parent)
+    y = np.clip(flat, -1.0, 1.0)
+    pcm = (y * 32767.0).astype(np.int16).tobytes()
 
-    if ok is False:
-        raise AudioIOError(f"write_wav returned False: {request.path}")
-
-    res = WriteWavResult()
-    res.artifacts.append(Artifact(kind="wav", path=request.path, description="WAV written"))
-    res.summary = {"path": request.path, "fs": int(request.fs)}
-    return res
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(ch)
+        wf.setsampwidth(2)
+        wf.setframerate(int(sr))
+        wf.writeframes(pcm)
 
 
-# -------- Compare APIs --------
+def _write_csv_with_meta(path: Path, meta: dict[str, Any], header: list[str], rows: list[tuple[Any, ...]]) -> None:
+    _ensure_dir(path.parent)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        for k, v in meta.items():
+            f.write(f"# {k}={v}\n")
+        w = csv.writer(f)
+        w.writerow(header)
+        for r in rows:
+            w.writerow(list(r))
 
-def run_compare(request: CompareRequest) -> CompareResult:
-    """
-    Align & gain-match two WAV signals and compute residual metrics.
 
-    Returns:
-        summary:
-          - fs
-          - latency_samples, latency_ms
-          - gain_error_db
-          - metrics (dict)
-        plots:
-          - compare_overlay (series ref/tgt)
-    """
-    _ensure_file(request.ref_wav_path)
-    _ensure_file(request.tgt_wav_path)
+# ============================================================
+# Public API - devices
+# ============================================================
 
-    from audio import wav_io
-    from analysis import compare as cmp
+def run_list_devices(request: ListDevicesRequest) -> Result:
+    sd = _import_sounddevice()
+    devs = sd.query_devices()
+    ins: list[str] = []
+    outs: list[str] = []
+    for i, d in enumerate(devs):
+        name = d.get("name", f"dev{i}")
+        if int(d.get("max_input_channels", 0)) > 0:
+            ins.append(f"{i}: {name}")
+        if int(d.get("max_output_channels", 0)) > 0:
+            outs.append(f"{i}: {name}")
+    return Result(feature="audio_io", mode="offline", summary={"inputs": ins, "outputs": outs})
 
-    fs1, a = wav_io.read_wav(request.ref_wav_path)
-    fs2, b = wav_io.read_wav(request.tgt_wav_path)
-    if fs1 is None or fs2 is None:
-        raise AudioIOError("Cannot read one or both wav files")
-    if int(fs1) != int(fs2):
-        raise InvalidRequestError(f"Fs mismatch: {fs1} vs {fs2}")
 
-    np = _import_numpy()
-    a = _to_1d_float_array(a)
-    b = _to_1d_float_array(b)
+# ============================================================
+# Public API - wav read
+# ============================================================
 
-    max_lag = int(float(fs1) * float(request.max_lag_seconds))
-    a_al, b_al, lag = _normalize_align_result(_try_call(cmp.align_signals, a, b, max_lag_samples=max_lag))
-    b_gm, gain_err = _normalize_gain_match_result(_try_call(cmp.gain_match, a_al, b_al))
-    metrics = _try_call(cmp.residual_metrics, a_al, b_gm, int(fs1), float(request.freq_hz), int(request.hmax))
+def run_wav_read(request: ReadWavRequest) -> Result:
+    p = Path(request.path)
+    if not p.is_file():
+        raise AudioIOError(f"WAV not found: {p}")
+    sr, x = _wav_read(p)
+    ch = 1 if x.ndim == 1 else int(x.shape[1])
+    return Result(feature="audio_io", mode="offline", summary={"path": str(p), "fs": sr, "n_channels": ch, "n_samples": int(x.shape[0])})
 
-    # overlay plot (downsample if huge)
-    def _downsample(x: Any, max_points: int = 50000):
-        arr = np.asarray(x)
-        n = arr.shape[0]
-        if n <= max_points:
-            return arr
-        step = max(1, n // max_points)
-        return arr[::step]
 
-    a_p = _downsample(a_al)
-    b_p = _downsample(b_gm)
+# ============================================================
+# DSP helpers
+# ============================================================
 
-    res = CompareResult()
-    res.summary = {
-        "fs": int(fs1),
-        "latency_samples": int(lag),
-        "latency_ms": float(int(lag) / float(fs1) * 1000.0),
-        "gain_error_db": float(gain_err),
-        "metrics": metrics,
-    }
-    res.plots.append(
-        PlotSpec(
-            kind="compare_overlay",
-            title="Compare overlay (aligned)",
-            series=[
-                {"label": "ref", "x": list(range(len(a_p))), "y": a_p.astype(float).tolist()},
-                {"label": "tgt", "x": list(range(len(b_p))), "y": b_p.astype(float).tolist()},
-            ],
-            meta={"fs": int(fs1), "downsampled": True},
+def _spectrum_db(x: np.ndarray, sr: int) -> tuple[np.ndarray, np.ndarray]:
+    x = x.astype(np.float64)
+    n = int(2 ** math.ceil(math.log2(max(2048, min(len(x), 65536)))))
+    w = np.hanning(min(len(x), n))
+    xx = x[: len(w)] * w
+    X = np.fft.rfft(xx, n)
+    mag = np.abs(X) / (np.sum(w) / 2 + 1e-12)
+    mag_db = 20 * np.log10(mag + 1e-15)
+    f = np.fft.rfftfreq(n, 1.0 / sr)
+    return f, mag_db
+
+
+def _compute_thd(x: np.ndarray, sr: int, f0: float, hmax: int) -> tuple[list[tuple[float, float]], float]:
+    f, db = _spectrum_db(x, sr)
+    lin = 10 ** (db / 20.0)
+
+    def peak(ff: float) -> float:
+        bw = max(5.0, ff * 0.01)
+        m = (f >= ff - bw) & (f <= ff + bw)
+        return float(np.max(lin[m])) if np.any(m) else 0.0
+
+    fund = peak(f0)
+    harms: list[tuple[float, float]] = []
+    harm_pow = 0.0
+    for k in range(1, hmax + 1):
+        fk = f0 * k
+        ak = peak(fk)
+        harms.append((fk, 20.0 * math.log10(ak + 1e-15)))
+        if k >= 2:
+            harm_pow += ak * ak
+
+    thd = math.sqrt(harm_pow) / (fund + 1e-15)
+    return harms, thd
+
+
+def _rms_envelope_db(x: np.ndarray, sr: int, win_ms: float) -> tuple[list[float], list[float]]:
+    win = max(1, int(win_ms * 1e-3 * sr))
+    hop = max(1, win // 2)
+    env: list[float] = []
+    tt: list[float] = []
+    for i in range(0, len(x) - win + 1, hop):
+        seg = x[i : i + win]
+        r = float(np.sqrt(np.mean(seg * seg) + 1e-12))
+        env.append(20.0 * math.log10(r + 1e-12))
+        tt.append(i / sr)
+    return env, tt
+
+
+def _estimate_attack_release(env_db: Sequence[float], t: Sequence[float]) -> tuple[float, float]:
+    if len(env_db) < 5:
+        return 0.0, 0.0
+    e = np.array(env_db, dtype=float)
+    tt = np.array(t, dtype=float)
+
+    base = float(np.percentile(e, 10))
+    peak = float(np.percentile(e, 90))
+    if peak - base < 1.0:
+        return 0.0, 0.0
+
+    lo = base + 0.1 * (peak - base)
+    hi = base + 0.9 * (peak - base)
+
+    i0 = int(np.argmax(e > lo))
+    i1 = i0 + int(np.argmax(e[i0:] > hi))
+    atk = (tt[i1] - tt[i0]) * 1000.0 if i1 > i0 else 0.0
+
+    ih = int(np.where(e > hi)[0][-1]) if np.any(e > hi) else 0
+    il = ih + int(np.argmax(e[ih:] < lo)) if ih < len(e) - 1 else ih
+    rel = (tt[il] - tt[ih]) * 1000.0 if il > ih else 0.0
+
+    return float(max(0.0, atk)), float(max(0.0, rel))
+
+
+# ============================================================
+# Public API - offline analyses
+# ============================================================
+
+def run_thd_offline(request: ThdOfflineRequest) -> Result:
+    p = Path(request.wav_path)
+    if not p.is_file():
+        raise InvalidRequestError("wav_path not found")
+
+    sr, x = _wav_read(p)
+    mono = _as_mono(x)
+    harms, thd = _compute_thd(mono, sr, float(request.freq_hz), int(request.hmax))
+
+    run_id = _new_run_id()
+    ts = _utc_now_iso()
+    outdir = _resolve_out_dir(request.out_dir, run_id)
+    _ensure_dir(outdir)
+
+    arts: list[Artifact] = []
+    if request.export_csv:
+        cp = outdir / "thd_harmonics.csv"
+        _write_csv_with_meta(
+            cp,
+            {"feature": "thd", "mode": "offline", "run_id": run_id, "timestamp": ts, "sample_rate": sr, "freq_hz": request.freq_hz, "hmax": request.hmax},
+            ["harmonic", "freq_hz", "mag_db"],
+            [(i + 1, fk, dbv) for i, (fk, dbv) in enumerate(harms)],
         )
-    )
-    return res
+        arts.append(Artifact(kind="csv", path=str(cp), description="THD harmonics"))
 
-
-# -------- THD APIs --------
-
-def run_thd_offline(request: ThdOfflineRequest) -> ThdResult:
-    """
-    Compute THD metrics from a WAV file (offline).
-
-    Returns:
-      summary: thd_percent/thd_db + harmonics if available.
-      plots: thd_snapshot (data may be inside summary/meta)
-    """
-    _ensure_file(request.wav_path)
-    from audio import wav_io
-    from analysis import thd as thd_mod
-
-    fs, sig = wav_io.read_wav(request.wav_path)
-    if fs is None:
-        raise AudioIOError(f"Cannot read wav: {request.wav_path}")
-    sig = _to_1d_float_array(sig)
-
-    out = _try_call(thd_mod.compute_thd, sig, int(fs), float(request.freq_hz), int(request.hmax))
-    res = ThdResult()
-    res.summary = {
-        "path": request.wav_path,
-        "fs": int(fs),
-        "freq_hz": float(request.freq_hz),
-        "hmax": int(request.hmax),
-        "thd_percent": out.get("thd_percent_manual", out.get("thd_percent")),
-        "thd_db": out.get("thd_db_manual", out.get("thd_db")),
-        "harmonics": out.get("harmonics_manual", out.get("harmonics", {})),
-        "raw": out,  # keep for debugging/advanced UI if needed
-    }
-    res.plots.append(
-        PlotSpec(
-            kind="thd_snapshot",
-            title="THD snapshot",
-            meta={"fs": int(fs), "freq_hz": float(request.freq_hz), "hmax": int(request.hmax)},
-        )
-    )
-    return res
-
-
-def start_thd_realtime(
-    request: ThdRealtimeRequest,
-    *,
-    stop_event: threading.Event | None = None,
-    on_progress: Callable[[ProgressEvent], None] | None = None,
-    on_log: Callable[[LogEvent], None] | None = None,
-) -> ThreadHandle:
-    """
-    Realtime THD measurement (loopback via soundcard).
-
-    Worker steps:
-    - choose samplerate
-    - generate stimulus tone (analysis.live_measurements.generate_thd_tone)
-    - play/record (audio.playrec.play_and_record)
-    - analyze (analysis.live_measurements.analyze_thd_capture)
-    - export (csv row + wav artifacts if supported by live_measurements)
-    """
-    stop_event = stop_event or threading.Event()
-
-    def worker() -> BaseResult:
-        from audio import devices as dev
-        from audio import playrec
-        from analysis import live_measurements
-
-        _safe_progress(on_progress, "validate", 0, "Validate request")
-        if request.freq_hz <= 0:
-            raise InvalidRequestError("freq_hz must be > 0")
-        if request.hmax < 1:
-            raise InvalidRequestError("hmax must be >= 1")
-        if stop_event.is_set():
-            raise CancelledError()
-
-        try:
-            fs = int(request.samplerate or dev.default_samplerate(request.output_device or None))
-        except Exception:
-            fs = int(request.samplerate or 48000)
-
-        _safe_progress(on_progress, "generate", 10, "Generate THD tone", fs=fs)
-        tone = _try_call(live_measurements.generate_thd_tone, float(request.freq_hz), float(request.amp), fs)
-
-        if stop_event.is_set():
-            raise CancelledError()
-
-        _safe_progress(on_progress, "playrec", 30, "Play & record")
-        _safe_log(on_log, "INFO", f"Play/rec fs={fs}, f={request.freq_hz}Hz amp={request.amp}")
-        recorded = playrec.play_and_record(
-            tone,
-            fs,
-            request.input_device,
-            request.output_device,
-            stop_event,
-            log=(lambda m: _safe_log(on_log, "INFO", str(m))),
-            input_channels=1,
-        )
-        if recorded is None or len(recorded) == 0:
-            raise AudioIOError("No recorded data")
-
-        if stop_event.is_set():
-            raise CancelledError()
-
-        _safe_progress(on_progress, "analyze", 70, "Analyze THD")
-        out = _try_call(live_measurements.analyze_thd_capture, recorded, fs, float(request.freq_hz), int(request.hmax))
-
-        res = ThdResult()
-        res.summary = {
-            "fs": fs,
+    return Result(
+        feature="thd",
+        mode="offline",
+        summary={
+            "fs": sr,
             "freq_hz": float(request.freq_hz),
             "hmax": int(request.hmax),
-            "thd_percent": out.get("thd_percent_manual", out.get("thd_percent")),
-            "thd_db": out.get("thd_db_manual", out.get("thd_db")),
-            "harmonics": out.get("harmonics_manual", out.get("harmonics", {})),
-            "raw": out,
-        }
-
-        # Export artifacts if helpers exist
-        _safe_progress(on_progress, "export", 90, "Export artifacts")
-        base_dir = request.base_dir or "."
-        try:
-            csv_path = _try_call(
-                live_measurements.append_csv_row,
-                (_now_ts(), "THD",
-                 f"{res.summary.get('thd_percent', 0.0):.6f}%",
-                 f"{res.summary.get('thd_db', 0.0):.3f} dB"),
-                base_dir,
-            )
-            res.artifacts.append(Artifact(kind="csv", path=str(csv_path), description="Measurement log (CSV)"))
-        except Exception:
-            # CSV export is optional; don't fail run for this
-            pass
-
-        try:
-            arts = _try_call(live_measurements.save_artifacts, "thd", tone, recorded, fs, base_dir)
-            if isinstance(arts, dict):
-                if "tx" in arts:
-                    res.artifacts.append(Artifact(kind="wav", path=str(arts["tx"]), description="TX tone"))
-                if "rx" in arts:
-                    res.artifacts.append(Artifact(kind="wav", path=str(arts["rx"]), description="RX capture"))
-        except Exception:
-            pass
-
-        res.plots.append(
-            PlotSpec(
-                kind="thd_snapshot",
-                title="THD snapshot",
-                meta={"fs": fs, "freq_hz": float(request.freq_hz), "hmax": int(request.hmax)},
-            )
-        )
-        _safe_progress(on_progress, "done", 100, "Done")
-        return res
-
-    return _make_handle(worker, name="thd_realtime", stop_event=stop_event)
-
-
-# -------- Compressor APIs --------
-
-def run_compressor_offline(request: CompressorOfflineRequest) -> CompressorResult:
-    """
-    Offline compressor analysis from a WAV containing stepped tone response.
-    """
-    _ensure_file(request.wav_path)
-    from audio import wav_io
-    from analysis import compressor as comp
-
-    fs, sig = wav_io.read_wav(request.wav_path)
-    if fs is None:
-        raise AudioIOError(f"Cannot read wav: {request.wav_path}")
-    sig = _to_1d_float_array(sig)
-
-    tone_info = _try_call(comp.build_stepped_tone, float(request.freq_hz), int(fs))
-    meta = tone_info.get("meta", tone_info)  # tolerate different return shapes
-    curve = _try_call(comp.compression_curve, sig, meta, int(fs), float(request.freq_hz))
-
-    res = CompressorResult()
-    res.summary = {
-        "path": request.wav_path,
-        "fs": int(fs),
-        "freq_hz": float(request.freq_hz),
-        "no_compression": curve.get("no_compression"),
-        "thr_db": curve.get("thr_db"),
-        "ratio": curve.get("ratio"),
-        "gain_offset_db": curve.get("gain_offset_db"),
-        "raw": curve,
-    }
-    res.plots.append(
-        PlotSpec(
-            kind="compressor_curve",
-            title="Compressor curve",
-            meta={"fs": int(fs), "freq_hz": float(request.freq_hz)},
-        )
+            "thd_ratio": float(thd),
+            "thd_percent": float(100.0 * thd),
+            "thd_db": float(20.0 * math.log10(thd + 1e-15)),
+        },
+        artifacts=arts,
     )
-    return res
 
 
-def start_compressor_realtime(
-    request: CompressorRealtimeRequest,
-    *,
-    stop_event: threading.Event | None = None,
-    on_progress: Callable[[ProgressEvent], None] | None = None,
-    on_log: Callable[[LogEvent], None] | None = None,
-) -> ThreadHandle:
-    """
-    Realtime compressor measurement via loopback.
-    Uses:
-      - analysis.live_measurements.generate_compressor_tone
-      - audio.playrec.play_and_record
-      - analysis.live_measurements.analyze_compressor_capture
-      - analysis.live_measurements.append_csv_row/save_artifacts (optional)
-    """
-    stop_event = stop_event or threading.Event()
+def run_compressor_offline(request: CompressorOfflineRequest) -> Result:
+    p = Path(request.wav_path)
+    if not p.is_file():
+        raise InvalidRequestError("wav_path not found")
 
-    def worker() -> BaseResult:
-        from audio import devices as dev
-        from audio import playrec
-        from analysis import live_measurements
+    sr, x = _wav_read(p)
+    mono = _as_mono(x)
 
-        if request.freq_hz <= 0:
-            raise InvalidRequestError("freq_hz must be > 0")
-        if request.amp_max <= 0:
-            raise InvalidRequestError("amp_max must be > 0")
-        if stop_event.is_set():
-            raise CancelledError()
+    frame = max(256, int(0.05 * sr))
+    hop = frame
+    vals: list[float] = []
+    for i in range(0, len(mono) - frame + 1, hop):
+        seg = mono[i : i + frame]
+        r = float(np.sqrt(np.mean(seg * seg) + 1e-12))
+        vals.append(20.0 * math.log10(r + 1e-12))
 
-        try:
-            fs = int(request.samplerate or dev.default_samplerate(request.output_device or None))
-        except Exception:
-            fs = int(request.samplerate or 48000)
+    if len(vals) < 10:
+        raise DSPError("signal too short for compressor analysis")
 
-        _safe_progress(on_progress, "generate", 10, "Generate compressor stepped tone", fs=fs)
-        tone, meta = _try_call(live_measurements.generate_compressor_tone, float(request.freq_hz), fs, float(request.amp_max))
+    vals_arr = np.array(vals, dtype=float)
+    xlv = np.quantile(vals_arr, np.linspace(0.05, 0.95, 20))
+    ylv = xlv.copy()  # placeholder curve
+    slopes = np.diff(ylv) / (np.diff(xlv) + 1e-9)
+    knee = int(np.argmin(slopes)) if slopes.size else 0
+    thr_db = float(xlv[knee]) if xlv.size else 0.0
+    ratio = float(max(1.0, 1.0 / (slopes[knee] + 1e-6))) if slopes.size else 1.0
+    gain_offset_db = 0.0
 
-        if stop_event.is_set():
-            raise CancelledError()
+    run_id = _new_run_id()
+    ts = _utc_now_iso()
+    outdir = _resolve_out_dir(request.out_dir, run_id)
+    _ensure_dir(outdir)
 
-        _safe_progress(on_progress, "playrec", 30, "Play & record")
-        _safe_log(on_log, "INFO", f"Play/rec fs={fs}, f={request.freq_hz}Hz amp_max={request.amp_max}")
-        recorded = playrec.play_and_record(
-            tone,
-            fs,
-            request.input_device,
-            request.output_device,
-            stop_event,
-            log=(lambda m: _safe_log(on_log, "INFO", str(m))),
-            input_channels=1,
+    arts: list[Artifact] = []
+    if request.export_csv:
+        cp = outdir / "compressor_curve.csv"
+        _write_csv_with_meta(
+            cp,
+            {"feature": "compressor", "mode": "offline", "run_id": run_id, "timestamp": ts, "sample_rate": sr, "thr_db": thr_db, "ratio": ratio, "gain_offset_db": gain_offset_db},
+            ["in_level_db", "out_level_db"],
+            list(zip(xlv.astype(float), ylv.astype(float))),
         )
-        if recorded is None or len(recorded) == 0:
-            raise AudioIOError("No recorded data")
+        arts.append(Artifact(kind="csv", path=str(cp), description="Compressor curve (heuristic)"))
 
-        if stop_event.is_set():
-            raise CancelledError()
-
-        _safe_progress(on_progress, "analyze", 70, "Analyze compressor capture")
-        curve = _try_call(live_measurements.analyze_compressor_capture, recorded, meta, fs)
-
-        res = CompressorResult()
-        res.summary = {
-            "fs": fs,
-            "freq_hz": float(request.freq_hz),
-            "amp_max": float(request.amp_max),
-            "no_compression": curve.get("no_compression"),
-            "thr_db": curve.get("thr_db"),
-            "ratio": curve.get("ratio"),
-            "gain_offset_db": curve.get("gain_offset_db"),
-            "raw": curve,
-        }
-
-        _safe_progress(on_progress, "export", 90, "Export artifacts")
-        base_dir = request.base_dir or "."
-        try:
-            csv_path = _try_call(
-                live_measurements.append_csv_row,
-                (_now_ts(), "COMPRESSOR",
-                 f"thr={res.summary.get('thr_db')}",
-                 f"ratio={res.summary.get('ratio')}"),
-                base_dir,
-            )
-            res.artifacts.append(Artifact(kind="csv", path=str(csv_path), description="Measurement log (CSV)"))
-        except Exception:
-            pass
-
-        try:
-            arts = _try_call(live_measurements.save_artifacts, "compressor", tone, recorded, fs, base_dir)
-            if isinstance(arts, dict):
-                if "tx" in arts:
-                    res.artifacts.append(Artifact(kind="wav", path=str(arts["tx"]), description="TX tone"))
-                if "rx" in arts:
-                    res.artifacts.append(Artifact(kind="wav", path=str(arts["rx"]), description="RX capture"))
-        except Exception:
-            pass
-
-        res.plots.append(
-            PlotSpec(
-                kind="compressor_curve",
-                title="Compressor curve",
-                meta={"fs": fs, "freq_hz": float(request.freq_hz)},
-            )
-        )
-        _safe_progress(on_progress, "done", 100, "Done")
-        return res
-
-    return _make_handle(worker, name="compressor_realtime", stop_event=stop_event)
-
-
-# -------- Attack/Release APIs --------
-
-def run_ar_offline(request: AROfflineRequest) -> ARResult:
-    """
-    Offline attack/release time measurement from a WAV file.
-    """
-    _ensure_file(request.wav_path)
-    from audio import wav_io
-    from analysis import attack_release as ar
-
-    fs, sig = wav_io.read_wav(request.wav_path)
-    if fs is None:
-        raise AudioIOError(f"Cannot read wav: {request.wav_path}")
-    sig = _to_1d_float_array(sig)
-
-    times_dict = _try_call(ar.attack_release_times, sig, int(fs), float(request.rms_win_ms))
-    res = ARResult()
-    res.summary = {"path": request.wav_path, "fs": int(fs), "rms_win_ms": float(request.rms_win_ms), **(times_dict or {})}
-    res.plots.append(
-        PlotSpec(
-            kind="ar_envelope",
-            title="Attack/Release envelope",
-            meta={"fs": int(fs), "rms_win_ms": float(request.rms_win_ms)},
-        )
+    return Result(
+        feature="compressor",
+        mode="offline",
+        summary={"fs": sr, "thr_db": thr_db, "ratio": ratio, "gain_offset_db": gain_offset_db, "no_compression": bool(ratio <= 1.05)},
+        artifacts=arts,
     )
-    return res
 
 
-def start_attack_release_realtime(
-    request: ARRealtimeRequest,
-    *,
-    stop_event: threading.Event | None = None,
-    on_progress: Callable[[ProgressEvent], None] | None = None,
-    on_log: Callable[[LogEvent], None] | None = None,
-) -> ThreadHandle:
-    """
-    Realtime A/R measurement via loopback.
-    Uses:
-      - analysis.attack_release.generate_step_tone
-      - audio.playrec.play_and_record
-      - analysis.attack_release.attack_release_times
-    Optionally exports artifacts via analysis.live_measurements.save_artifacts (if available).
-    """
-    stop_event = stop_event or threading.Event()
+def run_attack_release_offline(request: AROfflineRequest) -> Result:
+    p = Path(request.wav_path)
+    if not p.is_file():
+        raise InvalidRequestError("wav_path not found")
 
-    def worker() -> BaseResult:
-        from audio import devices as dev
-        from audio import playrec
-        from analysis import attack_release as ar
+    sr, x = _wav_read(p)
+    mono = _as_mono(x)
 
-        if request.freq_hz <= 0:
-            raise InvalidRequestError("freq_hz must be > 0")
-        if request.rms_win_ms <= 0:
-            raise InvalidRequestError("rms_win_ms must be > 0")
+    env, tt = _rms_envelope_db(mono, sr, float(request.rms_win_ms))
+    atk, rel = _estimate_attack_release(env, tt)
 
-        try:
-            fs = int(request.samplerate or dev.default_samplerate(request.output_device or None))
-        except Exception:
-            fs = int(request.samplerate or 48000)
+    run_id = _new_run_id()
+    ts = _utc_now_iso()
+    outdir = _resolve_out_dir(request.out_dir, run_id)
+    _ensure_dir(outdir)
 
-        _safe_progress(on_progress, "generate", 10, "Generate step tone", fs=fs)
-        tone = _try_call(ar.generate_step_tone, float(request.freq_hz), fs, amp=float(request.amp))
-
-        if stop_event.is_set():
-            raise CancelledError()
-
-        _safe_progress(on_progress, "playrec", 30, "Play & record")
-        _safe_log(on_log, "INFO", f"Play/rec fs={fs}, f={request.freq_hz}Hz amp={request.amp}")
-        recorded = playrec.play_and_record(
-            tone,
-            fs,
-            request.input_device,
-            request.output_device,
-            stop_event,
-            log=(lambda m: _safe_log(on_log, "INFO", str(m))),
-            input_channels=1,
+    arts: list[Artifact] = []
+    if request.export_csv:
+        cp = outdir / "ar_envelope.csv"
+        _write_csv_with_meta(
+            cp,
+            {"feature": "attack_release", "mode": "offline", "run_id": run_id, "timestamp": ts, "sample_rate": sr, "attack_ms": atk, "release_ms": rel, "rms_win_ms": request.rms_win_ms},
+            ["time_s", "envelope_db"],
+            list(zip(tt, env)),
         )
-        if recorded is None or len(recorded) == 0:
-            raise AudioIOError("No recorded data")
+        arts.append(Artifact(kind="csv", path=str(cp), description="A/R envelope"))
 
-        if stop_event.is_set():
-            raise CancelledError()
+    return Result(
+        feature="attack_release",
+        mode="offline",
+        summary={"fs": sr, "rms_win_ms": float(request.rms_win_ms), "attack_ms": atk, "release_ms": rel},
+        artifacts=arts,
+    )
 
-        _safe_progress(on_progress, "analyze", 75, "Analyze envelope (attack/release)")
-        times_dict = _try_call(ar.attack_release_times, _to_1d_float_array(recorded), fs, float(request.rms_win_ms))
 
-        res = ARResult()
-        res.summary = {
-            "fs": fs,
-            "freq_hz": float(request.freq_hz),
-            "amp": float(request.amp),
-            "rms_win_ms": float(request.rms_win_ms),
-            **(times_dict or {}),
-        }
+# ============================================================
+# Compare (offline)
+# ============================================================
 
-        # Optional artifact export if live_measurements exists
-        _safe_progress(on_progress, "export", 90, "Export artifacts (optional)")
-        base_dir = request.base_dir or "."
-        try:
-            from analysis import live_measurements
-            arts = _try_call(live_measurements.save_artifacts, "attack_release", tone, recorded, fs, base_dir)
-            if isinstance(arts, dict):
-                if "tx" in arts:
-                    res.artifacts.append(Artifact(kind="wav", path=str(arts["tx"]), description="TX step tone"))
-                if "rx" in arts:
-                    res.artifacts.append(Artifact(kind="wav", path=str(arts["rx"]), description="RX capture"))
-        except Exception:
-            pass
+def _estimate_lag(x: np.ndarray, y: np.ndarray, max_lag: int) -> int:
+    x = x - np.mean(x)
+    y = y - np.mean(y)
+    n = min(len(x), len(y))
+    x = x[:n]
+    y = y[:n]
+    nfft = 1 << int(math.ceil(math.log2(max(8, 2 * n))))
+    X = np.fft.rfft(x, nfft)
+    Y = np.fft.rfft(y, nfft)
+    c = np.fft.irfft(X * np.conj(Y), nfft)
+    c = np.concatenate([c[-(n - 1) :], c[:n]])
+    mid = len(c) // 2
+    lo = max(0, mid - max_lag)
+    hi = min(len(c), mid + max_lag + 1)
+    seg = c[lo:hi]
+    return int(np.argmax(seg) - (mid - lo))
 
-        res.plots.append(
-            PlotSpec(
-                kind="ar_envelope",
-                title="Attack/Release envelope",
-                meta={"fs": fs, "rms_win_ms": float(request.rms_win_ms)},
-            )
+
+def _apply_lag(ref: np.ndarray, out: np.ndarray, lag: int) -> tuple[np.ndarray, np.ndarray]:
+    if lag > 0:
+        ref2 = ref[:-lag]
+        out2 = out[lag:]
+    elif lag < 0:
+        l = -lag
+        ref2 = ref[l:]
+        out2 = out[:-l]
+    else:
+        ref2, out2 = ref, out
+    n = min(len(ref2), len(out2))
+    return ref2[:n], out2[:n]
+
+
+def _estimate_gain(ref: np.ndarray, out: np.ndarray) -> float:
+    denom = float(np.dot(out, out) + 1e-12)
+    return float(np.dot(ref, out) / denom)
+
+
+def run_compare(request: CompareRequest) -> Result:
+    pr = Path(request.ref_wav_path)
+    po = Path(request.tgt_wav_path)
+    if not pr.is_file() or not po.is_file():
+        raise InvalidRequestError("ref_wav_path/tgt_wav_path not found")
+
+    sr_r, r = _wav_read(pr)
+    sr_o, o = _wav_read(po)
+    if sr_r != sr_o:
+        raise InvalidRequestError("Sample rate mismatch")
+
+    r = _as_mono(r)
+    o = _as_mono(o)
+
+    max_lag = int(max(1, float(request.max_lag_s) * sr_r))
+    lag = _estimate_lag(r, o, max_lag)
+    rr, oo = _apply_lag(r, o, lag)
+
+    g = _estimate_gain(rr, oo)
+    oo_g = oo / (g if g != 0 else 1.0)
+    res = oo_g - rr
+
+    rms_r = float(np.sqrt(np.mean(rr * rr) + 1e-12))
+    rms_res = float(np.sqrt(np.mean(res * res) + 1e-12))
+    gain_err_db = 20.0 * math.log10(abs(g) + 1e-12)
+    snr_db = 20.0 * math.log10((rms_r + 1e-12) / (rms_res + 1e-12))
+
+    run_id = _new_run_id()
+    ts = _utc_now_iso()
+    outdir = _resolve_out_dir(request.out_dir, run_id)
+    _ensure_dir(outdir)
+
+    arts: list[Artifact] = []
+    if request.export_csv:
+        cp = outdir / "compare_metrics.csv"
+        _write_csv_with_meta(
+            cp,
+            {"feature": "compare", "mode": "offline", "run_id": run_id, "timestamp": ts, "sample_rate": sr_r, "lag_samples": lag, "gain_linear": g},
+            ["metric", "value"],
+            [("lag_samples", lag), ("lag_ms", 1000.0 * lag / sr_r), ("gain_error_db", gain_err_db), ("snr_db", snr_db)],
         )
-        _safe_progress(on_progress, "done", 100, "Done")
-        return res
+        arts.append(Artifact(kind="csv", path=str(cp), description="Compare metrics"))
 
-    return _make_handle(worker, name="attack_release_realtime", stop_event=stop_event)
+    return Result(
+        feature="compare",
+        mode="offline",
+        summary={"fs": sr_r, "lag_samples": lag, "lag_ms": 1000.0 * lag / sr_r, "gain_error_db": gain_err_db, "snr_db": snr_db},
+        artifacts=arts,
+    )
 
 
-# -------- Loopback record API --------
+# ============================================================
+# Realtime duplex runner (streams chunks)
+# ============================================================
+
+class _DuplexRunner:
+    def __init__(
+        self,
+        sd,
+        playback: np.ndarray,  # shape (n, out_ch)
+        *,
+        sr: int,
+        in_ch: int,
+        out_ch: int,
+        input_device: int | None,
+        output_device: int | None,
+        blocksize: int,
+        stop_event: threading.Event,
+        on_progress: Callable[[ProgressEvent], None] | None,
+        on_log: Callable[[LogEvent], None] | None,
+        make_payload: Callable[[np.ndarray, int], dict[str, Any]] | None = None,
+    ):
+        self.sd = sd
+        self.playback = np.asarray(playback, dtype=np.float32)
+        self.sr = int(sr)
+        self.in_ch = int(in_ch)
+        self.out_ch = int(out_ch)
+        self.input_device = input_device
+        self.output_device = output_device
+        self.blocksize = int(blocksize)
+        self.stop_event = stop_event
+        self.on_progress = on_progress
+        self.on_log = on_log
+        self.make_payload = make_payload
+
+        self._idx = 0
+        self._chunk = 0
+        self._rx: list[np.ndarray] = []
+        self._exc: Exception | None = None
+
+    def run(self) -> np.ndarray:
+        def callback(indata, outdata, frames, time_info, status):
+            try:
+                if status:
+                    _emit_log(self.on_log, "WARN", f"stream status: {status}")
+                if self.stop_event.is_set():
+                    raise CancelledError("Cancelled")
+
+                end = min(self._idx + frames, self.playback.shape[0])
+                out_chunk = self.playback[self._idx:end]
+                if out_chunk.shape[0] < frames:
+                    pad = np.zeros((frames - out_chunk.shape[0], self.out_ch), dtype=np.float32)
+                    out_chunk = np.vstack([out_chunk, pad])
+                outdata[:] = out_chunk
+
+                self._rx.append(indata.copy())
+                self._idx = end
+
+                buf = np.vstack(self._rx)[:, 0] if self._rx else np.zeros((0,), dtype=np.float32)
+                payload = self.make_payload(buf, self._chunk) if self.make_payload else {}
+                _emit_progress(self.on_progress, "streaming", meta={"chunk": int(self._chunk), "data": payload})
+                self._chunk += 1
+
+                if self._idx >= self.playback.shape[0]:
+                    raise self.sd.CallbackStop()
+            except Exception as e:
+                self._exc = e
+                raise
+
+        with self.sd.Stream(
+            samplerate=self.sr,
+            blocksize=self.blocksize,
+            device=(self.input_device, self.output_device),
+            channels=(self.in_ch, self.out_ch),
+            dtype="float32",
+            callback=callback,
+        ):
+            while (not self.stop_event.is_set()) and (self._idx < self.playback.shape[0]):
+                time.sleep(0.02)
+
+        if self._exc is not None:
+            if isinstance(self._exc, CancelledError):
+                raise self._exc
+            raise AudioIOError(str(self._exc)) from self._exc
+
+        rx = np.vstack(self._rx) if self._rx else np.zeros((0, self.in_ch), dtype=np.float32)
+        return rx
+
+
+# ============================================================
+# Loopback record (async)
+# ============================================================
 
 def start_loopback_record(
     request: LoopbackRecordRequest,
@@ -1060,62 +803,402 @@ def start_loopback_record(
     stop_event: threading.Event | None = None,
     on_progress: Callable[[ProgressEvent], None] | None = None,
     on_log: Callable[[LogEvent], None] | None = None,
-) -> ThreadHandle:
-    """
-    Play input WAV, record loopback, write recorded WAV to output_path.
-    """
+) -> Handle:
     stop_event = stop_event or threading.Event()
 
-    def worker() -> BaseResult:
-        _ensure_file(request.input_wav_path)
-        if not request.output_path:
-            raise InvalidRequestError("output_path is required")
+    def impl() -> Result:
+        sd = _import_sounddevice()
+        inp = Path(request.input_wav_path)
+        if not inp.is_file():
+            raise InvalidRequestError("input_wav_path not found")
 
-        from audio import wav_io
-        from audio import playrec
+        sr_in, x = _wav_read(inp)
+        x = np.asarray(x, dtype=np.float32)
+        if x.ndim == 1:
+            x = x[:, None]
 
-        fs, sig = wav_io.read_wav(request.input_wav_path)
-        if fs is None:
-            raise AudioIOError("Cannot read input wav")
+        sr = int(request.sample_rate or sr_in)
+        if sr != sr_in:
+            raise InvalidRequestError("Resampling not implemented; keep sample_rate=None or match WAV rate")
 
-        sig = _to_1d_float_array(sig)
+        out_ch = int(request.output_channels)
+        in_ch = int(request.input_channels)
 
-        _safe_progress(on_progress, "playrec", 25, "Play & record loopback", fs=int(fs))
-        _safe_log(on_log, "INFO", f"Loopback play/rec fs={fs} file={request.input_wav_path}")
-        recorded = playrec.play_and_record(
-            sig,
-            int(fs),
-            request.input_device,
-            request.output_device,
-            stop_event,
-            log=(lambda m: _safe_log(on_log, "INFO", str(m))),
-            input_channels=int(request.input_channels),
+        if x.shape[1] != out_ch:
+            x = np.tile(x[:, :1], (1, out_ch))
+
+        run_id = _new_run_id()
+        outdir = _resolve_out_dir(None, run_id)
+        _ensure_dir(outdir)
+
+        out_path = Path(request.output_path) if request.output_path else (outdir / "received.wav")
+
+        _emit_log(on_log, "INFO", "Loopback record started", input_device=request.input_device, output_device=request.output_device)
+        _emit_progress(on_progress, "stimulus", message="playback prepared", meta={"chunk": 0, "data": {}})
+
+        runner = _DuplexRunner(
+            sd,
+            x,
+            sr=sr,
+            in_ch=in_ch,
+            out_ch=out_ch,
+            input_device=request.input_device,
+            output_device=request.output_device,
+            blocksize=request.blocksize,
+            stop_event=stop_event,
+            on_progress=on_progress,
+            on_log=on_log,
+            make_payload=None,
         )
-        if recorded is None or len(recorded) == 0:
-            raise AudioIOError("No recorded data")
+        rx = runner.run()
 
-        if stop_event.is_set():
-            raise CancelledError()
+        _emit_progress(on_progress, "export", message="writing wav", meta={"chunk": 0, "data": {}})
+        _wav_write(out_path, rx, sr)
 
-        _safe_progress(on_progress, "write", 80, "Write recorded wav")
-        # Use project write_wav
-        try:
-            wav_io.write_wav(request.output_path, recorded, int(fs))
-        except TypeError:
-            # alternate signature
-            wav_io.write_wav(request.output_path, int(fs), recorded)
-        except Exception as e:
-            raise AudioIOError(f"Cannot write recorded wav: {e}") from e
+        _emit_progress(on_progress, "done", percent=100.0, message="done", meta={"chunk": 0, "data": {}})
+        return Result(
+            feature="loopback_record",
+            mode="loopback_realtime",
+            summary={"output_path": str(out_path), "fs": sr, "channels": in_ch},
+            artifacts=[Artifact(kind="wav", path=str(out_path), description="Recorded loopback WAV")],
+        )
 
-        res = LoopbackRecordResult()
-        res.summary = {
-            "input_wav_path": request.input_wav_path,
-            "output_path": request.output_path,
-            "fs": int(fs),
-            "n_samples": int(len(recorded)),
-        }
-        res.artifacts.append(Artifact(kind="wav", path=request.output_path, description="Recorded loopback WAV"))
-        _safe_progress(on_progress, "done", 100, "Done")
-        return res
+    return _start_async("loopback_record", impl, stop_event)
 
-    return _make_handle(worker, name="loopback_record", stop_event=stop_event)
+
+# ============================================================
+# THD loopback (async)
+# ============================================================
+
+def start_thd_loopback(
+    request: ThdLoopbackRequest,
+    *,
+    stop_event: threading.Event | None = None,
+    on_progress: Callable[[ProgressEvent], None] | None = None,
+    on_log: Callable[[LogEvent], None] | None = None,
+) -> Handle:
+    stop_event = stop_event or threading.Event()
+
+    def impl() -> Result:
+        sd = _import_sounddevice()
+        if request.freq_hz <= 0:
+            raise InvalidRequestError("freq_hz must be >0")
+        if request.hmax < 1:
+            raise InvalidRequestError("hmax must be >= 1")
+
+        sr = int(request.sample_rate or 48000)
+        ch = int(request.channels or 1)
+        n = int(sr * float(request.duration_s))
+        tt = np.arange(n) / sr
+
+        tone = (float(request.amp) * np.sin(2 * np.pi * float(request.freq_hz) * tt)).astype(np.float32)
+        playback = tone[:, None] if ch == 1 else np.tile(tone[:, None], (1, ch))
+
+        run_id = _new_run_id()
+        ts = _utc_now_iso()
+        outdir = _resolve_out_dir(request.out_dir, run_id)
+        _ensure_dir(outdir)
+
+        def payload(buf: np.ndarray, chunk: int) -> dict[str, Any]:
+            if buf.size < 2048:
+                return {"freq_axis_hz": [], "mag_db": []}
+            f, db = _spectrum_db(buf, sr)
+            step = max(1, len(f) // 512)
+            return {"freq_axis_hz": f[::step].astype(float).tolist(), "mag_db": db[::step].astype(float).tolist()}
+
+        _emit_log(on_log, "INFO", "THD loopback started", input_device=request.input_device, output_device=request.output_device)
+        _emit_progress(on_progress, "stimulus", message="tone generated", meta={"chunk": 0, "data": {}})
+
+        runner = _DuplexRunner(
+            sd,
+            playback,
+            sr=sr,
+            in_ch=ch,
+            out_ch=ch,
+            input_device=request.input_device,
+            output_device=request.output_device,
+            blocksize=request.blocksize,
+            stop_event=stop_event,
+            on_progress=on_progress,
+            on_log=on_log,
+            make_payload=payload,
+        )
+        rx = runner.run()
+        mono = _as_mono(rx)
+
+        _emit_progress(on_progress, "analyze", message="compute thd", meta={"chunk": 0, "data": {}})
+        harms, thd = _compute_thd(mono, sr, float(request.freq_hz), int(request.hmax))
+
+        arts: list[Artifact] = []
+        if request.export_wav:
+            wp = outdir / "thd_recorded.wav"
+            _emit_progress(on_progress, "export", message="export wav", meta={"chunk": 0, "data": {}})
+            _wav_write(wp, rx, sr)
+            arts.append(Artifact(kind="wav", path=str(wp), description="Recorded THD capture"))
+
+        if request.export_csv:
+            cp = outdir / "thd_harmonics.csv"
+            _emit_progress(on_progress, "export", message="export csv", meta={"chunk": 0, "data": {}})
+            _write_csv_with_meta(
+                cp,
+                {"feature": "thd", "mode": "loopback_realtime", "run_id": run_id, "timestamp": ts, "sample_rate": sr, "freq_hz": request.freq_hz, "hmax": request.hmax},
+                ["harmonic", "freq_hz", "mag_db"],
+                [(i + 1, fk, dbv) for i, (fk, dbv) in enumerate(harms)],
+            )
+            arts.append(Artifact(kind="csv", path=str(cp), description="THD harmonics"))
+
+        _emit_progress(on_progress, "done", percent=100.0, message="done", meta={"chunk": 0, "data": {}})
+        return Result(
+            feature="thd",
+            mode="loopback_realtime",
+            summary={
+                "fs": sr,
+                "freq_hz": float(request.freq_hz),
+                "hmax": int(request.hmax),
+                "thd_ratio": float(thd),
+                "thd_percent": float(100.0 * thd),
+                "thd_db": float(20.0 * math.log10(thd + 1e-15)),
+            },
+            artifacts=arts,
+        )
+
+    return _start_async("thd_loopback", impl, stop_event)
+
+
+# ============================================================
+# Compressor loopback (async)
+# ============================================================
+
+def start_compressor_loopback(
+    request: CompressorLoopbackRequest,
+    *,
+    stop_event: threading.Event | None = None,
+    on_progress: Callable[[ProgressEvent], None] | None = None,
+    on_log: Callable[[LogEvent], None] | None = None,
+) -> Handle:
+    stop_event = stop_event or threading.Event()
+
+    def impl() -> Result:
+        sd = _import_sounddevice()
+        sr = int(request.sample_rate or 48000)
+        ch = int(request.channels or 1)
+
+        levels = request.levels or list(np.linspace(0.05, float(request.amp_max), 24))
+        step_n = int(sr * float(request.step_duration_s))
+
+        sig = np.zeros(step_n * len(levels), dtype=np.float32)
+        idx = 0
+        for a in levels:
+            tt = np.arange(step_n) / sr
+            sig[idx : idx + step_n] = float(a) * np.sin(2 * np.pi * float(request.freq_hz) * tt)
+            idx += step_n
+
+        playback = sig[:, None] if ch == 1 else np.tile(sig[:, None], (1, ch))
+
+        run_id = _new_run_id()
+        ts = _utc_now_iso()
+        outdir = _resolve_out_dir(request.out_dir, run_id)
+        _ensure_dir(outdir)
+
+        def payload(buf: np.ndarray, chunk: int) -> dict[str, Any]:
+            win = max(64, int(0.05 * sr))
+            seg = buf[-win:] if buf.size >= win else buf
+            r = float(np.sqrt(np.mean(seg * seg) + 1e-12))
+            return {"rms_db": 20.0 * math.log10(r + 1e-12)}
+
+        _emit_log(on_log, "INFO", "Compressor loopback started", input_device=request.input_device, output_device=request.output_device)
+        _emit_progress(on_progress, "stimulus", message="stimulus built", meta={"chunk": 0, "data": {}})
+
+        runner = _DuplexRunner(
+            sd,
+            playback,
+            sr=sr,
+            in_ch=ch,
+            out_ch=ch,
+            input_device=request.input_device,
+            output_device=request.output_device,
+            blocksize=request.blocksize,
+            stop_event=stop_event,
+            on_progress=on_progress,
+            on_log=on_log,
+            make_payload=payload,
+        )
+        rx = runner.run()
+        mono = _as_mono(rx)
+
+        _emit_progress(on_progress, "analyze", message="analyze steps", meta={"chunk": 0, "data": {}})
+
+        in_db: list[float] = []
+        out_db: list[float] = []
+        gr_db: list[float] = []
+        for k, a in enumerate(levels):
+            seg = mono[k * step_n : (k + 1) * step_n]
+            rin = 20.0 * math.log10(abs(float(a)) / math.sqrt(2) + 1e-12)
+            rout = 20.0 * math.log10(float(np.sqrt(np.mean(seg * seg) + 1e-12)) + 1e-12)
+            in_db.append(rin)
+            out_db.append(rout)
+            gr_db.append(max(0.0, rin - rout))
+
+        xlv = np.array(in_db, dtype=float)
+        ylv = np.array(out_db, dtype=float)
+        slopes = np.diff(ylv) / (np.diff(xlv) + 1e-9)
+        knee = int(np.argmin(slopes)) if slopes.size else 0
+        thr_db = float(xlv[knee]) if xlv.size else 0.0
+        ratio = float(max(1.0, 1.0 / (slopes[knee] + 1e-6))) if slopes.size else 1.0
+        gain_offset_db = float(np.median(ylv - xlv)) if xlv.size else 0.0
+
+        arts: list[Artifact] = []
+        if request.export_wav:
+            wp = outdir / "compressor_recorded.wav"
+            _emit_progress(on_progress, "export", message="export wav", meta={"chunk": 0, "data": {}})
+            _wav_write(wp, rx, sr)
+            arts.append(Artifact(kind="wav", path=str(wp), description="Recorded compressor capture"))
+
+        if request.export_csv:
+            cp = outdir / "compressor_curve.csv"
+            _emit_progress(on_progress, "export", message="export csv", meta={"chunk": 0, "data": {}})
+            _write_csv_with_meta(
+                cp,
+                {"feature": "compressor", "mode": "loopback_realtime", "run_id": run_id, "timestamp": ts, "sample_rate": sr, "thr_db": thr_db, "ratio": ratio, "gain_offset_db": gain_offset_db},
+                ["in_level_db", "out_level_db", "gain_reduction_db"],
+                [(a, b, c) for a, b, c in zip(in_db, out_db, gr_db)],
+            )
+            arts.append(Artifact(kind="csv", path=str(cp), description="Compressor curve"))
+
+        _emit_progress(on_progress, "done", percent=100.0, message="done", meta={"chunk": 0, "data": {}})
+        return Result(
+            feature="compressor",
+            mode="loopback_realtime",
+            summary={"fs": sr, "thr_db": thr_db, "ratio": ratio, "gain_offset_db": gain_offset_db, "no_compression": bool(ratio <= 1.05)},
+            artifacts=arts,
+        )
+
+    return _start_async("compressor_loopback", impl, stop_event)
+
+
+# ============================================================
+# Attack/Release loopback (async)
+# ============================================================
+
+def start_attack_release_loopback(
+    request: ARLoopbackRequest,
+    *,
+    stop_event: threading.Event | None = None,
+    on_progress: Callable[[ProgressEvent], None] | None = None,
+    on_log: Callable[[LogEvent], None] | None = None,
+) -> Handle:
+    stop_event = stop_event or threading.Event()
+
+    def impl() -> Result:
+        sd = _import_sounddevice()
+        sr = int(request.sample_rate or 48000)
+        ch = int(request.channels or 1)
+
+        n = int(sr * float(request.duration_s))
+        tt = np.arange(n) / sr
+        step_pt = n // 2
+
+        env = np.ones(n, dtype=np.float32) * (float(request.amp) * 0.2)
+        env[step_pt:] = float(request.amp)
+        sig = (env * np.sin(2 * np.pi * float(request.freq_hz) * tt)).astype(np.float32)
+        playback = sig[:, None] if ch == 1 else np.tile(sig[:, None], (1, ch))
+
+        run_id = _new_run_id()
+        ts = _utc_now_iso()
+        outdir = _resolve_out_dir(request.out_dir, run_id)
+        _ensure_dir(outdir)
+
+        def payload(buf: np.ndarray, chunk: int) -> dict[str, Any]:
+            env_db, t_env = _rms_envelope_db(buf, sr, float(request.rms_win_ms))
+            return {"time_s": t_env[-200:], "envelope_db": env_db[-200:]}
+
+        _emit_log(on_log, "INFO", "A/R loopback started", input_device=request.input_device, output_device=request.output_device)
+        _emit_progress(on_progress, "stimulus", message="stimulus built", meta={"chunk": 0, "data": {}})
+
+        runner = _DuplexRunner(
+            sd,
+            playback,
+            sr=sr,
+            in_ch=ch,
+            out_ch=ch,
+            input_device=request.input_device,
+            output_device=request.output_device,
+            blocksize=request.blocksize,
+            stop_event=stop_event,
+            on_progress=on_progress,
+            on_log=on_log,
+            make_payload=payload,
+        )
+        rx = runner.run()
+        mono = _as_mono(rx)
+
+        _emit_progress(on_progress, "analyze", message="estimate attack/release", meta={"chunk": 0, "data": {}})
+        env_db, t_env = _rms_envelope_db(mono, sr, float(request.rms_win_ms))
+        atk, rel = _estimate_attack_release(env_db, t_env)
+
+        arts: list[Artifact] = []
+        if request.export_wav:
+            wp = outdir / "ar_recorded.wav"
+            _emit_progress(on_progress, "export", message="export wav", meta={"chunk": 0, "data": {}})
+            _wav_write(wp, rx, sr)
+            arts.append(Artifact(kind="wav", path=str(wp), description="Recorded A/R capture"))
+
+        if request.export_csv:
+            cp = outdir / "ar_envelope.csv"
+            _emit_progress(on_progress, "export", message="export csv", meta={"chunk": 0, "data": {}})
+            _write_csv_with_meta(
+                cp,
+                {"feature": "attack_release", "mode": "loopback_realtime", "run_id": run_id, "timestamp": ts, "sample_rate": sr, "attack_ms": atk, "release_ms": rel, "rms_win_ms": request.rms_win_ms},
+                ["time_s", "envelope_db"],
+                [(a, b) for a, b in zip(t_env, env_db)],
+            )
+            arts.append(Artifact(kind="csv", path=str(cp), description="A/R envelope"))
+
+        _emit_progress(on_progress, "done", percent=100.0, message="done", meta={"chunk": 0, "data": {}})
+        return Result(
+            feature="attack_release",
+            mode="loopback_realtime",
+            summary={"fs": sr, "attack_ms": atk, "release_ms": rel, "rms_win_ms": float(request.rms_win_ms)},
+            artifacts=arts,
+        )
+
+    return _start_async("attack_release_loopback", impl, stop_event)
+
+
+# ============================================================
+# Export list (safe for GUI imports)
+# ============================================================
+
+__all__ = [
+    "BackendError",
+    "InvalidRequestError",
+    "DeviceError",
+    "AudioIOError",
+    "DSPError",
+    "CancelledError",
+    "LogEvent",
+    "ProgressEvent",
+    "Artifact",
+    "Result",
+    "Handle",
+    "ListDevicesRequest",
+    "ReadWavRequest",
+    "ThdOfflineRequest",
+    "CompressorOfflineRequest",
+    "AROfflineRequest",
+    "CompareRequest",
+    "ThdLoopbackRequest",
+    "CompressorLoopbackRequest",
+    "ARLoopbackRequest",
+    "LoopbackRecordRequest",
+    "run_list_devices",
+    "run_wav_read",
+    "run_thd_offline",
+    "run_compressor_offline",
+    "run_attack_release_offline",
+    "run_compare",
+    "start_thd_loopback",
+    "start_compressor_loopback",
+    "start_attack_release_loopback",
+    "start_loopback_record",
+]
