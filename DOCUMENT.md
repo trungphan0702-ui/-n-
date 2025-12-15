@@ -109,3 +109,5 @@ g1-main/
 - Changing GUI layout, moving widgets, renaming controls, or splitting GUI code across files.
 - Bypassing `utils.plot_windows` for visualization or creating blocking plots.
 - Ignoring `stop_event`/cancellation patterns in long-running tasks.
+
+Backend public API = backend/contracts.py
